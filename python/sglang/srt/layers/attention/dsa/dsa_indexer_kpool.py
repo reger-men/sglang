@@ -180,6 +180,35 @@ class IndexerKPool(MultiPlatformOp):
         if is_hip():
             from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
+            # aiter's triton fp8_mqa_logits indexes the [n_q, n_k] fp32 logits with
+            # int32, so one call whose logits cross ~2 GiB wraps the index and aborts
+            # (iota_range Begin>End); the transient also has to fit in free VRAM.
+            # Bound each call by both the int32 limit and a slice of current free
+            # memory, splitting the (independent) query rows into chunks and
+            # stitching the rows back. Result matches the unchunked call.
+            n_q = q_fp8.shape[0]
+            # actual logits width can exceed k_fp8 rows after padding; keep margin.
+            row_bytes = max(1, int(k_fp8.shape[0]) * 4 * 2)
+            free_mem, _ = torch.cuda.mem_get_info(q_fp8.device)
+            budget = min(2**31 - 1, max(row_bytes, int(free_mem * 0.35)))
+            if n_q > 1 and n_q * row_bytes > budget:
+                rows = max(1, budget // row_bytes)
+                parts = []
+                for s in range(0, n_q, rows):
+                    e = min(s + rows, n_q)
+                    parts.append(
+                        fp8_mqa_logits(
+                            q_fp8[s:e],
+                            k_fp8,
+                            k_scale,
+                            weights[s:e],
+                            starts[s:e],
+                            ends[s:e],
+                            clean_logits=clean_logits,
+                        )
+                    )
+                return torch.cat(parts, dim=0)
+
             return fp8_mqa_logits(
                 q_fp8,
                 k_fp8,
